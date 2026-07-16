@@ -1,0 +1,31 @@
+services:
+  postgres:
+    ports: []
+    expose:
+      - "5432"
+
+  backend:
+    build:
+      context: ./app
+      dockerfile: Dockerfile.prod
+    expose:
+      - "3000"
+
+  frontend:
+    build:
+      context: ./web
+      dockerfile: Dockerfile.prod
+      args:
+        NEXT_PUBLIC_API_URL: ${PUBLIC_URL}/api
+        NEXT_IMAGE_HOSTS: ${PUBLIC_URL}
+    expose:
+      - "3001"
+
+  nginx:
+    build: ./nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - backend
+      - frontend

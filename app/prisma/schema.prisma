@@ -1,0 +1,21 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model ReservationRequest {
+  id           String   @id @default(uuid()) @db.Uuid
+  name         String   @db.VarChar(120)
+  email        String   @db.VarChar(190)
+  requestedFor DateTime @map("requested_for")
+  notes        String?
+  status       String   @default("pending") @db.VarChar(40)
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  @@index([status])
+  @@map("reservation_request")
+}

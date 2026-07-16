@@ -1,0 +1,85 @@
+name: Scaffold Smoke Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 1'
+
+jobs:
+  detect-scaffold-changes:
+    name: Detectar cambios del scaffold
+    runs-on: ubuntu-latest
+    outputs:
+      scaffold_related: ${{ steps.filter.outputs.scaffold_related }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect relevant changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            scaffold_related:
+              - 'cli/commands/scaffold.mjs'
+              - 'scripts/smoke-scaffold.mjs'
+              - 'package.json'
+              - 'package-lock.json'
+              - '.github/workflows/scaffold-smoke.yml'
+              - 'app/src/**/CreateProjectOrchestrator.ts'
+              - 'app/src/modules/generator/**'
+              - 'app/src/modules/platform/**'
+              - 'README.md'
+              - 'docs/architecture/scaffold-smoke-tests.md'
+
+  smoke-structural:
+    name: Smoke estructural
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install root dependencies
+        run: npm install
+
+      - name: Run structural scaffold smoke tests
+        run: npm run smoke:scaffold
+
+  smoke-install-build:
+    name: Smoke con install y build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    needs: detect-scaffold-changes
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event_name == 'schedule' ||
+      (contains(fromJson('["push","pull_request"]'), github.event_name) &&
+      needs.detect-scaffold-changes.outputs.scaffold_related == 'true')
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install root dependencies
+        run: npm install
+
+      - name: Run scaffold smoke tests with install
+        run: npm run smoke:scaffold -- --with-install

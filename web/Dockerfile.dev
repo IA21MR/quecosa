@@ -1,0 +1,37 @@
+# =====================================
+# Frontend Dockerfile - Development
+# =====================================
+# 
+# Optimizado para desarrollo con hot reload en Windows.
+# 
+# Turbopack: compilador incremental de Next.js 16, mucho más rápido que Webpack.
+# WATCHPACK_POLLING: necesario en Docker Desktop Windows (sin inotify nativo).
+
+FROM node:20-slim
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm install
+
+COPY . .
+
+ENV NODE_ENV=development
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV PORT=3001
+ENV HOSTNAME=0.0.0.0
+
+# ═══════════════════════════════════════════════════════════════
+# HOT RELOAD EN WINDOWS
+# ═══════════════════════════════════════════════════════════════
+# Polling necesario porque Docker Desktop Windows no soporta inotify.
+# Intervalo de 300ms es un balance entre reactividad y uso de CPU.
+ENV WATCHPACK_POLLING=true
+ENV WATCHPACK_POLLING_INTERVAL=300
+ENV CHOKIDAR_USEPOLLING=true
+ENV CHOKIDAR_INTERVAL=300
+
+EXPOSE 3001
+
+# Usar el binario directamente (sin npx overhead de búsqueda)
+CMD ["node", "node_modules/.bin/next", "dev", "-H", "0.0.0.0", "-p", "3001"]
