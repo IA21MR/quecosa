@@ -1,16 +1,21 @@
-name: Deploy Public Website
+# Deploy workflow — generado por SOTEK ERP Generator
+# Estrategia: build en GitHub Actions (rápido), deploy en Droplet (solo pull).
+#
+# Secrets necesarios (configurados por el Generador):
+#   SSH_PRIVATE_KEY  — clave privada ed25519
+#   DROPLET_IP       — IP pública del Droplet
+#   DROPLET_USER     — usuario SSH (root)
+
+name: Deploy to DigitalOcean
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
 
-concurrency:
-  group: deploy-production
-  cancel-in-progress: true
-
 jobs:
   build-and-deploy:
+    name: Build & Deploy
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -37,7 +42,7 @@ jobs:
           context: ./app
           file: ./app/Dockerfile.prod
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}-backend:latest
+          tags: ghcr.io/ia21mr/quecosa-backend:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -50,7 +55,7 @@ jobs:
           build-args: |
             NEXT_PUBLIC_API_URL=http://${{ secrets.DROPLET_IP }}/api
             NEXT_IMAGE_HOSTS=http://${{ secrets.DROPLET_IP }}
-          tags: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}-frontend:latest
+          tags: ghcr.io/ia21mr/quecosa-frontend:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -59,9 +64,20 @@ jobs:
         with:
           context: ./nginx
           push: true
-          tags: ghcr.io/${{ github.repository_owner }}/${{ github.event.repository.name }}-nginx:latest
+          tags: ghcr.io/ia21mr/quecosa-nginx:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Wait for SSH to be ready
+        run: |
+          echo "Waiting for SSH on ${{ secrets.DROPLET_IP }}:22..."
+          for i in $(seq 1 30); do
+            if nc -zv "${{ secrets.DROPLET_IP }}" 22 2>/dev/null; then
+              echo "SSH ready after $((i * 10))s"; exit 0
+            fi
+            echo "  attempt $i/30 — retrying in 10s..."; sleep 10
+          done
+          echo "ERROR: SSH not available"; exit 1
 
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v1.0.3
@@ -73,35 +89,115 @@ jobs:
           username: ${{ secrets.DROPLET_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           timeout: 60s
-          command_timeout: 10m
+          command_timeout: 25m
           envs: GITHUB_TOKEN,GITHUB_ACTOR
           script: |
             set -e
-            REPO_OWNER=$(echo "$GITHUB_REPOSITORY" | cut -d'/' -f1 | tr '[:upper:]' '[:lower:]' 2>/dev/null || echo "$GITHUB_ACTOR")
-            REPO_NAME=$(echo "$GITHUB_REPOSITORY" | cut -d'/' -f2 | tr '[:upper:]' '[:lower:]' 2>/dev/null || echo "site")
-            APP_DIR="/opt/${REPO_NAME}"
-            REPO_URL="https://github.com/${GITHUB_REPOSITORY}.git"
-            BACKEND_IMAGE="ghcr.io/${REPO_OWNER}/${REPO_NAME}-backend:latest"
-            FRONTEND_IMAGE="ghcr.io/${REPO_OWNER}/${REPO_NAME}-frontend:latest"
-            NGINX_IMAGE="ghcr.io/${REPO_OWNER}/${REPO_NAME}-nginx:latest"
+            export DEBIAN_FRONTEND=noninteractive
 
+            APP_DIR="/opt/quecosa"
+            REPO_URL="https://github.com/IA21MR/quecosa.git"
+            BACKEND_IMAGE="ghcr.io/ia21mr/quecosa-backend:latest"
+            FRONTEND_IMAGE="ghcr.io/ia21mr/quecosa-frontend:latest"
+            NGINX_IMAGE="ghcr.io/ia21mr/quecosa-nginx:latest"
+
+            # ── Wait for cloud-init (fresh Droplets) ─────────────────────
+            if command -v cloud-init &>/dev/null; then
+              echo "Waiting for cloud-init to finish..."
+              cloud-init status --wait 2>/dev/null || true
+            fi
+
+            # ── Disable apt automatic services to avoid lock conflicts ───
+            apt_prepare() {
+              systemctl stop unattended-upgrades apt-daily.service apt-daily-upgrade.service apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+              systemctl disable unattended-upgrades apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
+              # Wait up to 120s for any running apt/dpkg to finish
+              for i in $(seq 1 24); do
+                if ! pgrep -x apt-get >/dev/null && ! pgrep -x dpkg >/dev/null && ! pgrep -x unattended-upgr >/dev/null; then
+                  break
+                fi
+                echo "  waiting for apt/dpkg to finish ($i/24)..."
+                sleep 5
+              done
+              rm -f /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock /var/lib/dpkg/lock /var/cache/apt/archives/lock 2>/dev/null || true
+              dpkg --configure -a 2>/dev/null || true
+            }
+
+            # ── Wait for Docker daemon to be ready ───────────────────────
+            docker_wait() {
+              for i in $(seq 1 18); do
+                if docker info &>/dev/null; then return 0; fi
+                echo "  waiting for Docker daemon ($i/18)..."
+                sleep 5
+              done
+              echo "ERROR: Docker daemon not responding after 90s"; return 1
+            }
+
+            # ── Pull with retry ──────────────────────────────────────────
+            docker_pull_retry() {
+              local image="$1"
+              for attempt in 1 2 3; do
+                if docker pull "$image"; then return 0; fi
+                echo "  pull attempt $attempt/3 failed, retrying in 10s..."
+                sleep 10
+              done
+              echo "ERROR: failed to pull $image after 3 attempts"; return 1
+            }
+
+            # ── Install Docker if not present or not functional ──────────
+            if ! docker info &>/dev/null; then
+              echo "Installing Docker..."
+              apt_prepare
+              curl -fsSL https://get.docker.com | sh
+              systemctl enable docker
+              systemctl restart containerd
+              systemctl restart docker
+              docker_wait
+            fi
+
+            # ── Install git if not present ───────────────────────────────
+            if ! command -v git &>/dev/null; then
+              echo "Installing git..."
+              apt_prepare
+              apt-get update -y -qq
+              apt-get install -y -qq git
+            fi
+
+            # ── Clone or update the repository ───────────────────────────
+            # Inject token into URL so private repos work without SSH keys
+            AUTHED_URL=$(echo "$REPO_URL" | sed "s|https://|https://${GITHUB_TOKEN}@|")
             if [ ! -d "$APP_DIR/.git" ]; then
-              git clone "$REPO_URL" "$APP_DIR"
+              git clone "$AUTHED_URL" "$APP_DIR"
             else
               cd "$APP_DIR"
+              git remote set-url origin "$AUTHED_URL"
               git fetch origin
               git reset --hard origin/main 2>/dev/null || git reset --hard origin/master
             fi
 
             cd "$APP_DIR"
-            if [ ! -f .env ]; then cp .env.server.example .env 2>/dev/null || cp .env.example .env; fi
+            if [ ! -f .env ] && [ -f .env.example ]; then cp .env.example .env; fi
 
-            echo "$GITHUB_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-            docker pull "$BACKEND_IMAGE"
-            docker pull "$FRONTEND_IMAGE"
-            docker pull "$NGINX_IMAGE"
-            docker compose -f docker-compose.server.yml down --remove-orphans 2>/dev/null || true
+            # ── Actualizar PUBLIC_URL con la IP real del Droplet ─────────
+            # El .env.example tiene PUBLIC_URL=http://localhost como placeholder.
+            # El backend usa PUBLIC_URL para CORS_ORIGINS y FRONTEND_URL,
+            # por lo que debe apuntar a la IP pública del servidor.
+            DROPLET_IP="${{ secrets.DROPLET_IP }}"
+            if [ -f .env ]; then
+              if grep -q "^PUBLIC_URL=" .env; then
+                sed -i "s|^PUBLIC_URL=.*|PUBLIC_URL=http://$DROPLET_IP|" .env
+              else
+                echo "PUBLIC_URL=http://$DROPLET_IP" >> .env
+              fi
+            fi
 
+            # ── Login to GHCR and pull pre-built images ───────────────────
+            echo "${GITHUB_TOKEN}" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+            docker_pull_retry "$BACKEND_IMAGE"
+            docker_pull_retry "$FRONTEND_IMAGE"
+            docker_pull_retry "$NGINX_IMAGE"
+
+            # ── Run with pre-built images (no build on server) ───────────
             {
               echo "services:"
               echo "  backend:"
@@ -115,5 +211,37 @@ jobs:
               echo "    build: null"
             } > /tmp/compose-images.yml
 
-            docker compose -f docker-compose.server.yml -f /tmp/compose-images.yml up -d --remove-orphans
+            # ── Tear down previous stack to avoid container name conflicts ─
+            PROJECT_NAME="quecosa"
+
+            # Best-effort: try every compose file we might have used historically.
+            for COMPOSE_FILE in docker-compose.server.yml docker-compose.prod.yml docker-compose.yml; do
+              if [ -f "$COMPOSE_FILE" ]; then
+                docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" down --remove-orphans --timeout 30 2>/dev/null || true
+              fi
+            done
+
+            # Hard-remove any leftover containers from this project (handles
+            # cases where a previous deploy created containers with a different
+            # compose file or where docker compose down failed silently).
+            LEFTOVER_BY_LABEL=$(docker ps -aq --filter "label=com.docker.compose.project=${PROJECT_NAME}" 2>/dev/null || true)
+            if [ -n "$LEFTOVER_BY_LABEL" ]; then
+              echo "Removing leftover compose containers: $LEFTOVER_BY_LABEL"
+              docker rm -f $LEFTOVER_BY_LABEL 2>/dev/null || true
+            fi
+
+            for SERVICE in postgres backend frontend nginx; do
+              CONTAINER_NAME="${PROJECT_NAME}-${SERVICE}-1"
+              if docker ps -aq --filter "name=^/${CONTAINER_NAME}$" | grep -q .; then
+                echo "Removing leftover container: $CONTAINER_NAME"
+                docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+              fi
+            done
+
+            # ── Bring up the new stack ────────────────────────────────────
+            docker compose -p "$PROJECT_NAME" -f docker-compose.server.yml -f /tmp/compose-images.yml up -d --remove-orphans --force-recreate
+
+            # ── Cleanup old images ───────────────────────────────────────
             docker image prune -f >/dev/null 2>&1 || true
+
+            echo "Deploy completed successfully."
